@@ -5,11 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 import html
 import json
+import logging
 import os
 import sqlite3
 import ssl
 import textwrap
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -25,6 +27,11 @@ try:
     import certifi
 except ImportError:
     certifi = None
+
+try:
+    from google.cloud import bigquery
+except ImportError:
+    bigquery = None
 
 
 DEFAULT_KEYWORDS = [
@@ -126,6 +133,57 @@ DEFAULT_TOPIC_HINTS = {
 DEFAULT_POSITIVE_HINTS = ["宣布", "支持", "主打", "推出", "領先", "看好", "回升"]
 DEFAULT_NEGATIVE_HINTS = ["質疑", "爭議", "弊案", "失言", "起訴", "檢調", "下滑", "暴跌"]
 
+DEFAULT_ALLOWED_SOURCE_NAMES = [
+    "Google News 台灣政治",
+    "Google News 輿情聲量",
+    "Google News 爭議觀測",
+    "中央社政治",
+    "中央社兩岸",
+    "自由時報政治",
+    "自由時報軍武",
+]
+
+DEFAULT_ALLOWED_PUBLISHERS = [
+    "中央社",
+    "中央社 CNA",
+    "自由時報",
+    "風傳媒",
+    "三立新聞網",
+    "Newtalk新聞",
+    "聯合新聞網",
+    "TVBS新聞網",
+    "ETtoday新聞雲",
+    "NOWnews今日新聞",
+    "Yahoo新聞",
+    "公視新聞網PNN",
+    "鏡新聞",
+    "上報",
+]
+
+DEFAULT_AGGREGATOR_DOMAINS = [
+    "news.google.com",
+    "tw.news.yahoo.com",
+    "ynews.page.link",
+]
+
+DEFAULT_ALLOWED_SOURCE_DOMAINS = [
+    "news.google.com",
+    "tw.news.yahoo.com",
+    "ynews.page.link",
+    "www.cna.com.tw",
+    "www.cna.com.tw",
+    "news.ltn.com.tw",
+    "www.storm.mg",
+    "www.setn.com",
+    "www.nownews.com",
+    "newtalk.tw",
+    "news.tvbs.com.tw",
+    "www.ettoday.net",
+    "udn.com",
+    "www.cw.com.tw",
+    "www.upmedia.mg",
+]
+
 DEFAULT_RSS_FEEDS = [
     {
         "name": "Google News 台灣政治",
@@ -217,6 +275,16 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def env_csv(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -254,12 +322,23 @@ SSL_CA_BUNDLE = os.getenv("SSL_CA_BUNDLE", "")
 DEDUPE_HOURS = env_int("DEDUPE_HOURS", 24)
 TELEGRAM_PREVIEW = env_bool("TELEGRAM_PREVIEW", True)
 MAX_FEED_WORKERS = env_int("MAX_FEED_WORKERS", 4)
+RECENT_NEWS_HOURS = env_float("RECENT_NEWS_HOURS", 1.5)
+MIN_PUSH_IMPORTANCE = float(os.getenv("MIN_PUSH_IMPORTANCE", "6.5"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_PATH = Path(os.getenv("NEWS_MONITOR_LOG", str(Path(__file__).resolve().with_name("news_monitor.log"))))
+BIGQUERY_PROJECT_ID = os.getenv("BIGQUERY_PROJECT_ID", "").strip()
+BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "").strip()
+BIGQUERY_TABLE = os.getenv("BIGQUERY_TABLE", "").strip()
 USER_AGENT = os.getenv(
     "NEWS_USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
 KEYWORDS = env_csv("MONITOR_KEYWORDS", DEFAULT_KEYWORDS)
+ALLOWED_SOURCE_NAMES = env_csv("ALLOWED_SOURCE_NAMES", DEFAULT_ALLOWED_SOURCE_NAMES)
+ALLOWED_PUBLISHERS = env_csv("ALLOWED_PUBLISHERS", DEFAULT_ALLOWED_PUBLISHERS)
+AGGREGATOR_DOMAINS = env_csv("AGGREGATOR_DOMAINS", DEFAULT_AGGREGATOR_DOMAINS)
+ALLOWED_SOURCE_DOMAINS = env_csv("ALLOWED_SOURCE_DOMAINS", DEFAULT_ALLOWED_SOURCE_DOMAINS)
 PRIORITY_KEYWORDS = env_csv("PRIORITY_KEYWORDS", DEFAULT_PRIORITY_KEYWORDS)
 POSITIVE_HINTS = env_csv("POSITIVE_HINTS", DEFAULT_POSITIVE_HINTS)
 NEGATIVE_HINTS = env_csv("NEGATIVE_HINTS", DEFAULT_NEGATIVE_HINTS)
@@ -268,11 +347,45 @@ TOPIC_HINTS = env_json_dict("TOPIC_HINTS_JSON", DEFAULT_TOPIC_HINTS)
 RSS_FEEDS = DEFAULT_RSS_FEEDS
 
 
+def setup_logging() -> logging.Logger:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("news_monitor")
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    logger.handlers.clear()
+
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    for noisy_logger in ("httpx", "httpcore", "openai"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    return logger
+
+
+logger = setup_logging()
+
+
 def get_openai_client() -> Any:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
+        logger.warning("OpenAI client unavailable; fallback analysis will be used.")
         return None
     return OpenAI(api_key=api_key)
+
+
+def get_bigquery_client() -> Any:
+    if not (BIGQUERY_PROJECT_ID and BIGQUERY_DATASET and BIGQUERY_TABLE):
+        return None
+    if bigquery is None:
+        logger.warning("BigQuery env is configured but google-cloud-bigquery is not installed.")
+        return None
+    try:
+        return bigquery.Client(project=BIGQUERY_PROJECT_ID)
+    except Exception:
+        logger.exception("Failed to initialize BigQuery client.")
+        return None
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -303,6 +416,8 @@ def init_db() -> sqlite3.Connection:
             importance REAL,
             angle TEXT,
             raw_analysis TEXT,
+            impact_analysis TEXT,
+            action_suggest TEXT,
             sent_to_telegram INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         )
@@ -310,6 +425,8 @@ def init_db() -> sqlite3.Connection:
     )
     ensure_column(conn, "articles", "matched_keywords", "TEXT")
     ensure_column(conn, "articles", "source_kind", "TEXT")
+    ensure_column(conn, "articles", "impact_analysis", "TEXT")
+    ensure_column(conn, "articles", "action_suggest", "TEXT")
     return conn
 
 
@@ -431,6 +548,8 @@ def fallback_analysis(title: str, matched_keywords: list[str]) -> dict[str, Any]
         f" 目前歸類為 {category}，風向判定偏 {angle}。"
         f" 命中的觀測關鍵字有：{keyword_text}，建議持續追蹤後續聲量與各方回應。"
     )
+    impact_analysis = f"短期內可能牽動{topic}相關攻防與聲量變化，建議持續追蹤後續回應。"
+    action_suggest = f"優先監看{keyword_text}與主要對象後續表態。"
     return {
         "summary": summary,
         "category": category,
@@ -438,6 +557,8 @@ def fallback_analysis(title: str, matched_keywords: list[str]) -> dict[str, Any]
         "entities": entities,
         "importance": round(importance, 1),
         "angle": angle,
+        "impact_analysis": impact_analysis[:50],
+        "action_suggest": action_suggest[:50],
         "matched_keywords": matched_keywords,
     }
 
@@ -456,7 +577,9 @@ def analyze_news(client: Any, title: str, matched_keywords: list[str]) -> dict[s
           "topic": "最主要議題",
           "entities": ["人物、政黨或機構"],
           "importance": 1 到 10 的數字,
-          "angle": "正面/負面/中性"
+          "angle": "正面/負面/中性",
+          "impact_analysis": "這則新聞對政治局勢可能造成的後續影響，限50字內",
+          "action_suggest": "給幕僚或觀測者的下一步建議，限50字內"
         }}
 
         已命中關鍵字：{', '.join(matched_keywords) if matched_keywords else '無'}
@@ -470,7 +593,7 @@ def analyze_news(client: Any, title: str, matched_keywords: list[str]) -> dict[s
             messages=[
                 {
                     "role": "system",
-                    "content": "你負責台灣輿情監測，擅長分類、摘要、估算重要度與風向。",
+                    "content": "你負責台灣政治輿情監測，擅長分類、摘要、估算重要度、風向、後續影響與行動建議。",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -482,9 +605,12 @@ def analyze_news(client: Any, title: str, matched_keywords: list[str]) -> dict[s
         payload["angle"] = payload.get("angle") or infer_angle(title)
         payload["category"] = payload.get("category") or infer_category(title)
         payload["topic"] = payload.get("topic") or infer_topic(title)
+        payload["impact_analysis"] = (payload.get("impact_analysis") or f"此事可能牽動{payload['topic']}後續攻防與聲量。")[:50]
+        payload["action_suggest"] = (payload.get("action_suggest") or "建議持續觀察當事人回應與媒體延燒。")[:50]
         payload["matched_keywords"] = matched_keywords
         return payload
     except Exception:
+        logger.exception("OpenAI analysis failed; using fallback analysis.")
         return fallback_analysis(title, matched_keywords)
 
 
@@ -505,6 +631,103 @@ def build_ssl_context() -> ssl.SSLContext:
     return SSL_CONTEXT
 
 
+def parse_datetime_text(value: str) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        parsed_dt = datetime.fromisoformat(value)
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        return parsed_dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    try:
+        parsed_dt = parsedate_to_datetime(value)
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        return parsed_dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def sqlite_utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def published_time_for_storage(raw_value: str) -> str:
+    parsed_dt = parse_datetime_text(raw_value)
+    if parsed_dt is None:
+        return sqlite_utc_now()
+    return parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_entry_datetime(entry: Any) -> datetime | None:
+    for attr in ("published_parsed", "updated_parsed"):
+        parsed = getattr(entry, attr, None)
+        if parsed:
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+    for attr in ("published", "updated"):
+        raw_value = getattr(entry, attr, "")
+        if not raw_value:
+            continue
+        parsed_dt = parse_datetime_text(raw_value)
+        if parsed_dt is not None:
+            return parsed_dt
+    return None
+
+
+def is_recent_entry(entry: Any, hours: float = RECENT_NEWS_HOURS) -> bool:
+    published_dt = parse_entry_datetime(entry)
+    if published_dt is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return published_dt >= cutoff
+
+
+def extract_domain(link: str) -> str:
+    try:
+        return parse.urlparse(link).netloc.lower()
+    except Exception:
+        return ""
+
+
+def extract_publisher(title: str) -> str:
+    if " - " in title:
+        return title.rsplit(" - ", 1)[-1].strip()
+    if "｜" in title:
+        return title.rsplit("｜", 1)[-1].strip()
+    if "|" in title:
+        return title.rsplit("|", 1)[-1].strip()
+    return ""
+
+
+def is_allowed_source(feed_name: str, link: str, title: str) -> bool:
+    domain = extract_domain(link)
+    publisher = extract_publisher(title)
+    allowed_name = not ALLOWED_SOURCE_NAMES or feed_name in ALLOWED_SOURCE_NAMES
+    allowed_domain = not ALLOWED_SOURCE_DOMAINS or any(
+        domain == allowed or domain.endswith(f".{allowed}")
+        for allowed in ALLOWED_SOURCE_DOMAINS
+    )
+    allowed_publisher = not ALLOWED_PUBLISHERS or any(
+        publisher == allowed or publisher.endswith(allowed) or allowed in publisher
+        for allowed in ALLOWED_PUBLISHERS
+    )
+    is_aggregator = any(
+        domain == allowed or domain.endswith(f".{allowed}")
+        for allowed in AGGREGATOR_DOMAINS
+    )
+    if is_aggregator:
+        return allowed_name and allowed_publisher
+    return allowed_name and allowed_domain
+
+
 def load_feed(url: str) -> Any:
     req = request.Request(
         url,
@@ -518,7 +741,7 @@ def load_feed(url: str) -> Any:
     return feedparser.parse(content)
 
 
-def fetch_feed_items(feed_config: dict[str, str]) -> tuple[list[dict[str, Any]], str | None]:
+def fetch_feed_items(feed_config: dict[str, str], recent_hours: int = RECENT_NEWS_HOURS) -> tuple[list[dict[str, Any]], str | None]:
     try:
         feed = load_feed(feed_config["url"])
     except Exception as exc:
@@ -534,8 +757,17 @@ def fetch_feed_items(feed_config: dict[str, str]) -> tuple[list[dict[str, Any]],
     for entry in feed.entries:
         title = getattr(entry, "title", "").strip()
         link = getattr(entry, "link", "").strip()
-        published = getattr(entry, "published", "")
+        published_dt = parse_entry_datetime(entry)
+        published = published_dt.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT") if published_dt else getattr(entry, "published", "")
         if not title or not link:
+            continue
+        if not is_recent_entry(entry, hours=recent_hours):
+            logger.info(f"[舊聞略過] {feed_config['name']} | {title}")
+            continue
+        if not is_allowed_source(feed_config["name"], link, title):
+            logger.info(
+                f"[白名單略過] {feed_config['name']} | {title} | domain={extract_domain(link)} | publisher={extract_publisher(title)}"
+            )
             continue
 
         matched = keyword_matches(title)
@@ -558,17 +790,17 @@ def fetch_feed_items(feed_config: dict[str, str]) -> tuple[list[dict[str, Any]],
     return items, None
 
 
-def fetch_news() -> list[dict[str, Any]]:
+def fetch_news(recent_hours: int = RECENT_NEWS_HOURS) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     failed_sources = 0
     worker_count = max(1, min(MAX_FEED_WORKERS, len(RSS_FEEDS)))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(fetch_feed_items, feed) for feed in RSS_FEEDS]
+        futures = [executor.submit(fetch_feed_items, feed, recent_hours) for feed in RSS_FEEDS]
         for future in as_completed(futures):
             feed_items, error_message = future.result()
             if error_message:
                 failed_sources += 1
-                print(error_message)
+                logger.error(error_message)
                 continue
             items.extend(feed_items)
 
@@ -589,7 +821,7 @@ def fetch_news() -> list[dict[str, Any]]:
         deduped_items.append(item)
 
     if failed_sources == len(RSS_FEEDS):
-        print("[診斷] 所有 RSS 來源都讀取失敗，這通常是網路、DNS、代理或防火牆問題。")
+        logger.error("[診斷] 所有 RSS 來源都讀取失敗，這通常是網路、DNS、代理或防火牆問題。")
     return deduped_items[:MAX_ITEMS_PER_RUN]
 
 
@@ -651,9 +883,9 @@ def save_article(conn: sqlite3.Connection, item: dict[str, Any], analysis: dict[
         """
         INSERT INTO articles (
             dedupe_key, source_name, title, link, published_at, summary, category,
-            topic, entities, importance, angle, raw_analysis, matched_keywords,
-            source_kind, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            topic, entities, importance, angle, raw_analysis, impact_analysis,
+            action_suggest, matched_keywords, source_kind, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["dedupe_key"],
@@ -668,13 +900,48 @@ def save_article(conn: sqlite3.Connection, item: dict[str, Any], analysis: dict[
             float(analysis.get("importance", 5)),
             analysis.get("angle", "中性"),
             json.dumps(analysis, ensure_ascii=False),
+            analysis.get("impact_analysis", ""),
+            analysis.get("action_suggest", ""),
             keywords_json,
             item.get("source_kind", "general"),
-            datetime.now(timezone.utc).isoformat(),
+            published_time_for_storage(item.get("published_at", "")),
         ),
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def upload_to_bigquery(item: dict[str, Any], analysis: dict[str, Any]) -> tuple[bool, str]:
+    client = get_bigquery_client()
+    if client is None:
+        return False, "BigQuery 未設定或不可用"
+
+    table_id = f"{BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE}"
+    row = {
+        "source_name": item["source_name"],
+        "source_kind": item.get("source_kind", "general"),
+        "title": item["title"],
+        "link": item["link"],
+        "published_at": item.get("published_at") or "",
+        "summary": analysis.get("summary", ""),
+        "category": analysis.get("category", "一般輿情"),
+        "topic": analysis.get("topic", "一般輿情"),
+        "entities": analysis.get("entities", []),
+        "importance": float(analysis.get("importance", 5)),
+        "angle": analysis.get("angle", "中性"),
+        "impact_analysis": analysis.get("impact_analysis", ""),
+        "action_suggest": analysis.get("action_suggest", ""),
+        "matched_keywords": analysis.get("matched_keywords", item.get("matched_keywords", [])),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        job_config = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_APPEND)
+        job = client.load_table_from_json([row], table_id, job_config=job_config)
+        job.result()
+    except Exception:
+        logger.exception("BigQuery upload failed.")
+        return False, "BigQuery upload exception"
+    return True, "uploaded"
 
 
 def send_telegram_message(message: str) -> tuple[bool, str]:
@@ -741,6 +1008,12 @@ def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
 
         <b>摘要</b>
         {escape_html(analysis.get('summary', '無摘要'))}
+
+        <b>後續影響</b>
+        {escape_html(analysis.get('impact_analysis', '無'))}
+
+        <b>應對建議</b>
+        {escape_html(analysis.get('action_suggest', '無'))}
 
         <a href="{escape_html(item['link'])}">查看原文</a>
         """
@@ -814,25 +1087,25 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
 def send_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = DAILY_REPORT_LIMIT) -> None:
     report = build_daily_report(conn, hours=hours, limit=limit)
     if not report:
-        print("最近沒有可彙整的情報。")
+        logger.info("最近沒有可彙整的情報。")
         return
     sent, result = send_telegram_message(report)
     if sent:
-        print("每日輿情報告已推送。")
+        logger.info("每日輿情報告已推送。")
     else:
-        print(f"每日輿情報告未推送 | {result}")
+        logger.warning(f"每日輿情報告未推送 | {result}")
 
 
 def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
     conn = init_db()
     try:
         client = get_openai_client()
-        news_items = fetch_news()
+        news_items = fetch_news(recent_hours=RECENT_NEWS_HOURS)
         if not news_items:
-            print("沒有抓到符合條件的輿情新聞。")
+            logger.info("沒有抓到符合條件的輿情新聞。")
             return
 
-        print(f"本次抓到 {len(news_items)} 則候選新聞。")
+        logger.info(f"本次抓到 {len(news_items)} 則候選新聞。")
         duplicate_count = 0
         similar_count = 0
         new_count = 0
@@ -849,7 +1122,7 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
                 similar_title = find_similar_title_in_memory(recent_titles, item["title"])
                 if similar_title is not None:
                     similar_count += 1
-                    print(f"[相似略過] {item['title']} | 類似於: {similar_title}")
+                    logger.info(f"[相似略過] {item['title']} | 類似於: {similar_title}")
                     continue
             if ignore_dedupe:
                 item["dedupe_key"] = build_runtime_dedupe_key(item["title"], item["link"])
@@ -864,22 +1137,34 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
             recent_titles = recent_titles[:200]
             new_count += 1
 
+            bq_uploaded, bq_result = upload_to_bigquery(item, analysis)
+            if bq_uploaded:
+                logger.info(f"[BigQuery 已同步] {item['title']}")
+            else:
+                logger.info(f"[BigQuery 未同步] {item['title']} | {bq_result}")
+
+            score = float(analysis.get("importance", 5))
+            if score < MIN_PUSH_IMPORTANCE:
+                logger.info(f"[低分未推送] {item['title']} | importance={score:.1f}")
+                continue
+
             message = format_message(item, analysis)
             sent, result = send_telegram_message(message)
             if sent:
                 mark_as_sent(conn, article_id)
                 sent_count += 1
-                print(f"[已推送] {item['title']}")
+                logger.info(f"[已推送] {item['title']}")
             else:
-                print(f"[已儲存未推送] {item['title']} | {result}")
+                logger.warning(f"[已儲存未推送] {item['title']} | {result}")
 
-        print("-" * 50)
-        print(f"候選新聞: {len(news_items)} 則")
-        print(f"重複略過: {duplicate_count} 則")
-        print(f"相似略過: {similar_count} 則")
-        print(f"新增情報: {new_count} 則")
-        print(f"Telegram 已推送: {sent_count} 則")
-        print(f"資料庫: {DB_PATH}")
+        logger.info("-" * 50)
+        logger.info(f"候選新聞: {len(news_items)} 則")
+        logger.info(f"重複略過: {duplicate_count} 則")
+        logger.info(f"相似略過: {similar_count} 則")
+        logger.info(f"新增情報: {new_count} 則")
+        logger.info(f"Telegram 已推送: {sent_count} 則")
+        logger.info(f"資料庫: {DB_PATH}")
+        logger.info(f"日誌檔: {LOG_PATH}")
     finally:
         conn.close()
 
@@ -903,11 +1188,11 @@ if __name__ == "__main__":
     args = parse_args()
     if args.mode == "monitor":
         if args.list_only:
-            news_items = fetch_news()
-            print(f"本次抓到 {len(news_items)} 則候選新聞。")
+            news_items = fetch_news(recent_hours=RECENT_NEWS_HOURS)
+            logger.info(f"本次抓到 {len(news_items)} 則候選新聞。")
             for index, item in enumerate(news_items, start=1):
                 keywords = "、".join(item.get("matched_keywords", [])[:4])
-                print(f"{index}. ({item['source_name']}) {item['title']} | 關鍵字: {keywords}")
+                logger.info(f"{index}. ({item['source_name']}) {item['title']} | 關鍵字: {keywords}")
         else:
             run_monitor_with_options(ignore_dedupe=args.ignore_dedupe)
     else:

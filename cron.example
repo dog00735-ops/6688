@@ -1,8 +1,0 @@
-SHELL=/bin/zsh
-PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
-
-# 每 30 分鐘抓一次新輿情情報
-*/30 * * * * /bin/sh '/Users/wangpindun/python_project/run_monitor.sh'
-
-# 每天晚上 9:00 傳一次輿情報告
-0 21 * * * /bin/sh '/Users/wangpindun/python_project/run_daily_report.sh'

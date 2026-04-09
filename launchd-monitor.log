@@ -1,2 +1,0 @@
-shell-init: error retrieving current directory: getcwd: cannot access parent directories: Operation not permitted
-/bin/sh: /Users/wangpindun/Documents/python_project/run_monitor.sh: Operation not permitted

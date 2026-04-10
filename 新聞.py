@@ -1088,7 +1088,7 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
             keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
 
         if index <= min(limit, 6):
-            headline = clean_headline(row["title"], max_length=28)
+            headline = clean_headline(row["title"], max_length=36)
             meta_parts = [category]
             if entity_text:
                 meta_parts.append(entity_text)

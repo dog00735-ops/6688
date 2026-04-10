@@ -1107,20 +1107,21 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
         f"""
         <b>{escape_html(MONITOR_NAME)}日報</b>
 
-        <b>觀測區間</b>
+        <b>⭐ 觀測區間</b>
         最近 {hours} 小時
 
-        <b>摘要</b>
+        <b>⭐ 摘要</b>
         • 情報數：{len(recent_articles)} 則
         • 高關注：{high_priority_count} 則
-        • 主戰場
+        • ⭐ 主戰場
         　{escape_html(category_summary)}
-        • 風向
+        • 🌪️ 風向
         　{escape_html(angle_summary)}
-        • 熱詞
+        • 🔥 熱詞
         　{escape_html(keyword_summary)}
 
-        <b>今晚焦點</b>
+        <b>⭐ 今日焦點</b>
+
         {escape_html(top_section)}
         """
     ).strip()

@@ -1005,11 +1005,11 @@ def compact_list(values: list[str], limit: int = 2, fallback: str = "未標記")
     return "、".join(cleaned[:limit])
 
 
-def compact_count_summary(counts: dict[str, int], limit: int = 3) -> str:
+def compact_count_summary(counts: dict[str, int], limit: int = 3, separator: str = "、") -> str:
     ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
     if not ranked:
         return "無"
-    return "／".join(f"{name}{count}" for name, count in ranked)
+    return separator.join(f"{name}{count}" for name, count in ranked)
 
 
 def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
@@ -1073,28 +1073,34 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
     high_priority_count = 0
 
     for index, row in enumerate(recent_articles, start=1):
-        category_counts[row["category"]] = category_counts.get(row["category"], 0) + 1
-        angle_counts[row["angle"]] = angle_counts.get(row["angle"], 0) + 1
+        category = row["category"] or "一般輿情"
+        angle = row["angle"] or "中性"
+        category_counts[category] = category_counts.get(category, 0) + 1
+        angle_counts[angle] = angle_counts.get(angle, 0) + 1
         score = float(row["importance"] or 0)
         if score >= 8.0:
             high_priority_count += 1
 
         entities = json.loads(row["entities"]) if row["entities"] else []
-        entity_text = compact_list(entities, limit=2)
+        entity_text = compact_list(entities, limit=1, fallback="")
         keywords = json.loads(row["matched_keywords"]) if row["matched_keywords"] else []
         for keyword in keywords[:3]:
             keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
 
         if index <= min(limit, 6):
-            headline = clean_headline(row["title"], max_length=30)
+            headline = clean_headline(row["title"], max_length=28)
+            meta_parts = [category]
+            if entity_text:
+                meta_parts.append(entity_text)
+            meta_parts.append(f"{score:.1f}/10")
             top_lines.append(
                 f"{index}. {headline}\n"
-                f"　{row['category']}｜{entity_text}｜{score:.1f}/10"
+                f"　{'｜'.join(meta_parts)}"
             )
 
-    category_summary = compact_count_summary(category_counts, limit=3)
-    angle_summary = compact_count_summary(angle_counts, limit=3)
-    keyword_summary = compact_count_summary(keyword_counts, limit=5)
+    category_summary = compact_count_summary(category_counts, limit=2)
+    angle_summary = compact_count_summary(angle_counts, limit=2)
+    keyword_summary = compact_count_summary(keyword_counts, limit=3)
     top_section = "\n\n".join(top_lines) if top_lines else "今日無重點新聞。"
 
     report = textwrap.dedent(
@@ -1107,9 +1113,12 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
         <b>摘要</b>
         • 情報數：{len(recent_articles)} 則
         • 高關注：{high_priority_count} 則
-        • 主戰場：{escape_html(category_summary)}
-        • 風向：{escape_html(angle_summary)}
-        • 關鍵字：{escape_html(keyword_summary)}
+        • 主戰場
+        　{escape_html(category_summary)}
+        • 風向
+        　{escape_html(angle_summary)}
+        • 熱詞
+        　{escape_html(keyword_summary)}
 
         <b>今晚焦點</b>
         {escape_html(top_section)}

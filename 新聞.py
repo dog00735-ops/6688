@@ -312,6 +312,7 @@ def env_json_dict(name: str, default: dict[str, list[str]]) -> dict[str, list[st
 
 DB_PATH = os.getenv("POLITICAL_INTEL_DB", os.getenv("OPINION_INTEL_DB", "political_intel.db"))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DAILY_COMMENTARY_MODEL = os.getenv("DAILY_COMMENTARY_MODEL", "gpt-5.4-mini")
 MONITOR_NAME = os.getenv("MONITOR_NAME", "台灣輿情監控")
 MAX_ITEMS_PER_RUN = env_int("MAX_ITEMS_PER_RUN", 10)
 ENABLE_TELEGRAM = env_bool("ENABLE_TELEGRAM", True)
@@ -1012,6 +1013,123 @@ def compact_count_summary(counts: dict[str, int], limit: int = 3, separator: str
     return separator.join(f"{name}{count}" for name, count in ranked)
 
 
+def limit_text(text: str, max_length: int) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 1].rstrip() + "…"
+
+
+def detect_parties(title: str, entities: list[str]) -> set[str]:
+    lowered = title.lower()
+    parties: set[str] = set()
+    for party in ("國民黨", "民進黨"):
+        if party in entities:
+            parties.add(party)
+            continue
+        for alias in ENTITY_HINTS.get(party, []):
+            if alias.lower() in lowered:
+                parties.add(party)
+                break
+    return parties
+
+
+def fallback_daily_commentary(recent_articles: list[sqlite3.Row]) -> tuple[str, str]:
+    party_scores = {"國民黨": 0.0, "民進黨": 0.0}
+    mention_counts = {"國民黨": 0, "民進黨": 0}
+    angle_weights = {"正面": 1.0, "中性": 0.0, "負面": -1.0}
+
+    for row in recent_articles:
+        title = row["title"] or ""
+        entities = json.loads(row["entities"]) if row["entities"] else []
+        parties = detect_parties(title, entities)
+        if not parties:
+            continue
+
+        weight = max(1.0, float(row["importance"] or 0))
+        delta = angle_weights.get(row["angle"] or "中性", 0.0) * weight
+        for party in parties:
+            party_scores[party] += delta
+            mention_counts[party] += 1
+
+    diff = party_scores["國民黨"] - party_scores["民進黨"]
+    if abs(diff) < 2.0:
+        winner = "互有攻防"
+        commentary = (
+            "今日日報中藍綠互有攻防，聲量集中在表態與議題回應，"
+            "尚未形成明顯單方全面領先。"
+        )
+    elif diff > 0:
+        winner = "國民黨略占上風"
+        commentary = (
+            "今日相關標題中，國民黨在高聲量焦點較占版面優勢，"
+            "但多屬短線攻防，未必代表整體民意定調。"
+        )
+    else:
+        winner = "民進黨略占上風"
+        commentary = (
+            "今日相關標題中，民進黨在回應與議題主導上較有存在感，"
+            "但優勢仍偏短線，後續仍需觀察延續性。"
+        )
+
+    if mention_counts["國民黨"] == 0 and mention_counts["民進黨"] == 0:
+        winner = "互有攻防"
+        commentary = "今日日報焦點分散，藍綠皆未形成明顯得分主軸，建議持續觀察後續聲量變化。"
+
+    return winner, limit_text(commentary, 60)
+
+
+def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.Row]) -> tuple[str, str]:
+    fallback_winner, fallback_commentary = fallback_daily_commentary(recent_articles)
+    if client is None or not recent_articles:
+        return fallback_winner, fallback_commentary
+
+    focus_lines: list[str] = []
+    for index, row in enumerate(recent_articles[:8], start=1):
+        entities = json.loads(row["entities"]) if row["entities"] else []
+        parties = "、".join(sorted(detect_parties(row["title"] or "", entities))) or "未明"
+        focus_lines.append(
+            f"{index}. 標題：{row['title']}｜類別：{row['category']}｜風向：{row['angle']}｜"
+            f"對象：{parties}｜分數：{float(row['importance'] or 0):.1f}"
+        )
+
+    prompt = textwrap.dedent(
+        f"""
+        你是台灣政治輿情分析師，請只根據以下新聞標題與簡單標記做保守判讀。
+        任務是判斷今天整體輿論對國民黨、民進黨誰相對得分，若無明顯差距就寫平手。
+        不要過度推論，不要下選舉結論。
+        請回傳 JSON：
+        {{
+          "winner": "國民黨略占上風/民進黨略占上風/互有攻防",
+          "commentary": "60字內，客觀講評"
+        }}
+
+        今日焦點：
+        {chr(10).join(focus_lines)}
+        """
+    ).strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=DAILY_COMMENTARY_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你負責撰寫台灣政治輿情簡報，口吻客觀、保守、精煉。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        payload = json.loads(response.choices[0].message.content)
+        winner = payload.get("winner") or fallback_winner
+        commentary = payload.get("commentary") or fallback_commentary
+        return limit_text(winner, 14), limit_text(commentary, 60)
+    except Exception:
+        logger.exception("Daily commentary generation failed; using fallback commentary.")
+        return fallback_winner, fallback_commentary
+
+
 def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
     entities = compact_list(analysis.get("entities", []), limit=3)
     keywords = compact_list(analysis.get("matched_keywords", item.get("matched_keywords", [])), limit=4)
@@ -1061,7 +1179,12 @@ def fetch_recent_articles(conn: sqlite3.Connection, hours: int, limit: int) -> l
     return rows
 
 
-def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = DAILY_REPORT_LIMIT) -> str:
+def build_daily_report(
+    conn: sqlite3.Connection,
+    hours: int = 24,
+    limit: int = DAILY_REPORT_LIMIT,
+    client: Any | None = None,
+) -> str:
     recent_articles = fetch_recent_articles(conn, hours=hours, limit=limit)
     if not recent_articles:
         return ""
@@ -1102,6 +1225,7 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
     angle_summary = compact_count_summary(angle_counts, limit=2)
     keyword_summary = compact_count_summary(keyword_counts, limit=3)
     top_section = "\n\n".join(top_lines) if top_lines else "今日無重點新聞。"
+    commentary_winner, commentary_text = generate_daily_commentary(client, recent_articles)
 
     report = textwrap.dedent(
         f"""
@@ -1120,13 +1244,18 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
         <b>⭐ 今日焦點</b>
 
         {escape_html(top_section)}
+
+        <b>🧠 AI講評</b>
+        今日判讀：{escape_html(commentary_winner)}
+        {escape_html(commentary_text)}
         """
     ).strip()
     return report
 
 
 def send_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = DAILY_REPORT_LIMIT) -> None:
-    report = build_daily_report(conn, hours=hours, limit=limit)
+    client = get_openai_client()
+    report = build_daily_report(conn, hours=hours, limit=limit, client=client)
     if not report:
         logger.info("最近沒有可彙整的情報。")
         return

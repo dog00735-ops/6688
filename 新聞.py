@@ -1056,27 +1056,27 @@ def fallback_daily_commentary(recent_articles: list[sqlite3.Row]) -> tuple[str, 
     if abs(diff) < 2.0:
         winner = "互有攻防"
         commentary = (
-            "今日日報中藍綠互有攻防，聲量集中在表態與議題回應，"
-            "尚未形成明顯單方全面領先。"
+            "今日日報中藍綠互有攻防，焦點多集中在表態、回應與議題延伸，"
+            "雙方皆有聲量，但仍未形成足以定調全天輿論的單邊優勢。"
         )
     elif diff > 0:
         winner = "國民黨略占上風"
         commentary = (
-            "今日相關標題中，國民黨在高聲量焦點較占版面優勢，"
-            "但多屬短線攻防，未必代表整體民意定調。"
+            "今日相關標題中，國民黨在高聲量焦點與議題主導上較占版面優勢，"
+            "但目前仍偏短線攻防，是否能轉成穩定加分仍待後續觀察。"
         )
     else:
         winner = "民進黨略占上風"
         commentary = (
-            "今日相關標題中，民進黨在回應與議題主導上較有存在感，"
-            "但優勢仍偏短線，後續仍需觀察延續性。"
+            "今日相關標題中，民進黨在回應節奏與議題主導上較有存在感，"
+            "但現階段仍偏短線優勢，是否延續仍要看後續新聞與聲量變化。"
         )
 
     if mention_counts["國民黨"] == 0 and mention_counts["民進黨"] == 0:
         winner = "互有攻防"
-        commentary = "今日日報焦點分散，藍綠皆未形成明顯得分主軸，建議持續觀察後續聲量變化。"
+        commentary = "今日日報焦點較分散，藍綠皆未形成明確得分主軸，整體更像零星攻防與議題交錯，後續仍需觀察聲量是否集中。"
 
-    return winner, limit_text(commentary, 60)
+    return winner, limit_text(commentary, 85)
 
 
 def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.Row]) -> tuple[str, str]:
@@ -1101,7 +1101,7 @@ def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.
         請回傳 JSON：
         {{
           "winner": "國民黨略占上風/民進黨略占上風/互有攻防",
-          "commentary": "60字內，客觀講評"
+          "commentary": "55到85字，客觀講評"
         }}
 
         今日焦點：
@@ -1124,7 +1124,7 @@ def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.
         payload = json.loads(response.choices[0].message.content)
         winner = payload.get("winner") or fallback_winner
         commentary = payload.get("commentary") or fallback_commentary
-        return limit_text(winner, 14), limit_text(commentary, 60)
+        return limit_text(winner, 14), limit_text(commentary, 85)
     except Exception:
         logger.exception("Daily commentary generation failed; using fallback commentary.")
         return fallback_winner, fallback_commentary

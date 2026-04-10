@@ -987,19 +987,44 @@ def importance_label(score: float) -> str:
     return "低"
 
 
+def clean_headline(title: str, max_length: int = 34) -> str:
+    headline = title.strip()
+    for separator in (" - ", " | ", "｜"):
+        if separator in headline:
+            headline = headline.split(separator)[0].strip()
+            break
+    if len(headline) <= max_length:
+        return headline
+    return headline[: max_length - 1].rstrip() + "…"
+
+
+def compact_list(values: list[str], limit: int = 2, fallback: str = "未標記") -> str:
+    cleaned = [value.strip() for value in values if value and str(value).strip()]
+    if not cleaned:
+        return fallback
+    return "、".join(cleaned[:limit])
+
+
+def compact_count_summary(counts: dict[str, int], limit: int = 3) -> str:
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    if not ranked:
+        return "無"
+    return "／".join(f"{name}{count}" for name, count in ranked)
+
+
 def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
-    entities = "、".join(analysis.get("entities", []))
-    keywords = "、".join(analysis.get("matched_keywords", item.get("matched_keywords", []))[:5]) or "未標記"
+    entities = compact_list(analysis.get("entities", []), limit=3)
+    keywords = compact_list(analysis.get("matched_keywords", item.get("matched_keywords", [])), limit=4)
     published = item.get("published_at") or "未知時間"
     score = float(analysis.get("importance", 5))
+    headline = clean_headline(item["title"], max_length=42)
     return textwrap.dedent(
         f"""
         <b>{escape_html(MONITOR_NAME)}快報</b>
-        <b>{escape_html(item['title'])}</b>
+        <b>{escape_html(headline)}</b>
 
-        <b>重要度</b>：{importance_label(score)} | {score:.1f}/10
+        <b>評級</b>：{importance_label(score)}｜{score:.1f}/10
         <b>類別</b>：{escape_html(analysis.get('category', '一般輿情'))}
-        <b>主題</b>：{escape_html(analysis.get('topic', '一般輿情'))}
         <b>風向</b>：{escape_html(analysis.get('angle', '中性'))}
         <b>對象</b>：{escape_html(entities)}
         <b>關鍵字</b>：{escape_html(keywords)}
@@ -1025,7 +1050,7 @@ def fetch_recent_articles(conn: sqlite3.Connection, hours: int, limit: int) -> l
     rows = conn.execute(
         """
         SELECT title, source_name, category, topic, entities, importance, angle,
-               summary, link, created_at, matched_keywords
+               summary, link, created_at, matched_keywords, impact_analysis
         FROM articles
         WHERE created_at >= datetime('now', ?)
         ORDER BY importance DESC, created_at DESC
@@ -1044,41 +1069,50 @@ def build_daily_report(conn: sqlite3.Connection, hours: int = 24, limit: int = D
     category_counts: dict[str, int] = {}
     angle_counts: dict[str, int] = {}
     keyword_counts: dict[str, int] = {}
-    lines = []
+    top_lines: list[str] = []
+    high_priority_count = 0
 
     for index, row in enumerate(recent_articles, start=1):
         category_counts[row["category"]] = category_counts.get(row["category"], 0) + 1
         angle_counts[row["angle"]] = angle_counts.get(row["angle"], 0) + 1
+        score = float(row["importance"] or 0)
+        if score >= 8.0:
+            high_priority_count += 1
+
         entities = json.loads(row["entities"]) if row["entities"] else []
-        entity_text = "、".join(entities[:3]) if entities else "未標記"
+        entity_text = compact_list(entities, limit=2)
         keywords = json.loads(row["matched_keywords"]) if row["matched_keywords"] else []
         for keyword in keywords[:3]:
             keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
-        lines.append(
-            f"{index}. [{row['category']}] {row['title']} | {entity_text} | {row['importance']}/10"
-        )
 
-    category_summary = "、".join(
-        f"{name}{count}則" for name, count in sorted(category_counts.items(), key=lambda item: item[1], reverse=True)
-    )
-    angle_summary = "、".join(
-        f"{name}{count}則" for name, count in sorted(angle_counts.items(), key=lambda item: item[1], reverse=True)
-    )
-    keyword_summary = "、".join(
-        f"{name}{count}" for name, count in sorted(keyword_counts.items(), key=lambda item: item[1], reverse=True)[:6]
-    ) or "無"
+        if index <= min(limit, 6):
+            headline = clean_headline(row["title"], max_length=30)
+            top_lines.append(
+                f"{index}. {headline}\n"
+                f"　{row['category']}｜{entity_text}｜{score:.1f}/10"
+            )
+
+    category_summary = compact_count_summary(category_counts, limit=3)
+    angle_summary = compact_count_summary(angle_counts, limit=3)
+    keyword_summary = compact_count_summary(keyword_counts, limit=5)
+    top_section = "\n\n".join(top_lines) if top_lines else "今日無重點新聞。"
 
     report = textwrap.dedent(
         f"""
         <b>{escape_html(MONITOR_NAME)}日報</b>
-        <b>區間</b>：最近 {hours} 小時
-        <b>情報數</b>：{len(recent_articles)} 則
-        <b>類別分布</b>：{escape_html(category_summary)}
-        <b>風向分布</b>：{escape_html(angle_summary)}
-        <b>熱門關鍵字</b>：{escape_html(keyword_summary)}
 
-        <b>重點列表</b>
-        {escape_html(chr(10).join(lines))}
+        <b>觀測區間</b>
+        最近 {hours} 小時
+
+        <b>摘要</b>
+        • 情報數：{len(recent_articles)} 則
+        • 高關注：{high_priority_count} 則
+        • 主戰場：{escape_html(category_summary)}
+        • 風向：{escape_html(angle_summary)}
+        • 關鍵字：{escape_html(keyword_summary)}
+
+        <b>今晚焦點</b>
+        {escape_html(top_section)}
         """
     ).strip()
     return report

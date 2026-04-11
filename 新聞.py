@@ -1212,6 +1212,37 @@ def fallback_daily_commentary(recent_articles: list[sqlite3.Row]) -> tuple[str, 
     return winner, limit_text(commentary, 85)
 
 
+def build_briefing_sections(recent_articles: list[sqlite3.Row]) -> tuple[str, str, str]:
+    s_focus_lines: list[str] = []
+    watch_lines: list[str] = []
+
+    for row in recent_articles:
+        title = row["title"] or ""
+        category = row["category"] or "一般輿情"
+        score = float(row["importance"] or 0)
+        entities = json.loads(row["entities"]) if row["entities"] else []
+        keywords = json.loads(row["matched_keywords"]) if row["matched_keywords"] else []
+        priority_tier = determine_priority_tier(title, category, score, entities, keywords)
+        entity_text = compact_list(entities, limit=1, fallback="")
+
+        if priority_tier == "S" and len(s_focus_lines) < 3:
+            focus_headline = clean_headline(title, max_length=34)
+            meta_parts = [category]
+            if entity_text:
+                meta_parts.append(entity_text)
+            meta_parts.append(f"{score:.1f}/10")
+            s_focus_lines.append(f"• {focus_headline}\n　{'｜'.join(meta_parts)}")
+
+        if priority_tier in {"S", "A"} and len(watch_lines) < 2:
+            watch_headline = clean_headline(title, max_length=30)
+            watch_lines.append(f"• {watch_headline}")
+
+    s_focus_section = "\n\n".join(s_focus_lines) if s_focus_lines else "• 今日無明顯S級焦點，整體偏延續型攻防。"
+    watch_section = "\n".join(watch_lines) if watch_lines else "• 明日暫無明確追蹤主軸，可先觀察民調與提名動態。"
+    opening = "• 今日輿情主軸集中在高優先級選戰/聲量題，建議優先關注S、A級焦點的延伸反應。"
+    return opening, s_focus_section, watch_section
+
+
 def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.Row]) -> tuple[str, str]:
     fallback_winner, fallback_commentary = fallback_daily_commentary(recent_articles)
     if client is None or not recent_articles:
@@ -1363,6 +1394,7 @@ def build_daily_report(
     keyword_summary = compact_count_summary(keyword_counts, limit=3)
     priority_summary = compact_count_summary(priority_counts, limit=4)
     top_section = "\n\n".join(top_lines) if top_lines else "今日無重點新聞。"
+    opening_brief, s_focus_section, watch_section = build_briefing_sections(recent_articles)
     commentary_winner, commentary_text = generate_daily_commentary(client, recent_articles)
 
     report = textwrap.dedent(
@@ -1372,6 +1404,9 @@ def build_daily_report(
         <b>⭐ 觀測區間</b>
         最近 {hours} 小時
 
+        <b>🧭 今日提要</b>
+        {escape_html(opening_brief)}
+
         <b>⭐ 摘要</b>
         情報數：{len(recent_articles)} 則
         高關注：{high_priority_count} 則
@@ -1380,13 +1415,18 @@ def build_daily_report(
         🌪️ 風向：{escape_html(angle_summary)}
         🔥 熱詞：{escape_html(keyword_summary)}
 
-        <b>⭐ 今日焦點</b>
+        <b>🏆 今日S級焦點</b>
+        {escape_html(s_focus_section)}
 
-        {escape_html(top_section)}
-
-        <b>🧠 AI講評</b>
+        <b>🧠 勝負判讀</b>
         今日判讀：{escape_html(commentary_winner)}
         {escape_html(commentary_text)}
+
+        <b>🔭 明日追蹤</b>
+        {escape_html(watch_section)}
+
+        <b>⭐ 今日焦點清單</b>
+        {escape_html(top_section)}
         """
     ).strip()
     return report

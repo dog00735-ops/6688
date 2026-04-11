@@ -328,6 +328,7 @@ RECENT_NEWS_HOURS = env_float("RECENT_NEWS_HOURS", 1.5)
 POLL_IMPORTANCE_BONUS = env_float("POLL_IMPORTANCE_BONUS", 0.9)
 CAMPAIGN_IMPORTANCE_BONUS = env_float("CAMPAIGN_IMPORTANCE_BONUS", 0.7)
 ELECTION_KEYWORD_BONUS = env_float("ELECTION_KEYWORD_BONUS", 0.25)
+MONITOR_WINDOW_START_HOUR = env_int("MONITOR_WINDOW_START_HOUR", 9)
 MIN_PUSH_IMPORTANCE = float(os.getenv("MIN_PUSH_IMPORTANCE", "6.5"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_PATH = Path(os.getenv("NEWS_MONITOR_LOG", str(Path(__file__).resolve().with_name("news_monitor.log"))))
@@ -868,30 +869,41 @@ def fetch_news(recent_hours: int = RECENT_NEWS_HOURS) -> list[dict[str, Any]]:
     return deduped_items[:MAX_ITEMS_PER_RUN]
 
 
-def article_exists(conn: sqlite3.Connection, dedupe_key: str, hours: int = DEDUPE_HOURS) -> bool:
+def current_monitor_window_start_utc(now: datetime | None = None) -> str:
+    current_time = now.astimezone(TAIPEI_CST) if now else datetime.now(TAIPEI_CST)
+    window_start = current_time.replace(
+        hour=MONITOR_WINDOW_START_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return window_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def article_exists_since(conn: sqlite3.Connection, dedupe_key: str, since_utc: str) -> bool:
     row = conn.execute(
         """
         SELECT 1
         FROM articles
         WHERE dedupe_key = ?
-          AND created_at >= datetime('now', ?)
+          AND created_at >= ?
         LIMIT 1
         """,
-        (dedupe_key, f"-{hours} hours"),
+        (dedupe_key, since_utc),
     ).fetchone()
     return row is not None
 
 
-def load_recent_titles(conn: sqlite3.Connection, hours: int = DEDUPE_HOURS) -> list[str]:
+def load_recent_titles_since(conn: sqlite3.Connection, since_utc: str) -> list[str]:
     rows = conn.execute(
         """
         SELECT title
         FROM articles
-        WHERE created_at >= datetime('now', ?)
+        WHERE created_at >= ?
         ORDER BY created_at DESC
         LIMIT 200
         """,
-        (f"-{hours} hours",),
+        (since_utc,),
     ).fetchall()
     return [title for (title,) in rows]
 
@@ -1180,7 +1192,7 @@ def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
     headline = clean_headline(item["title"], max_length=42)
     return textwrap.dedent(
         f"""
-        <b>{escape_html(MONITOR_NAME)}快報</b>
+        <b>⭐ 輿情監控 ⭐</b>
         <b>{escape_html(headline)}</b>
 
         <b>評級</b>：{importance_label(score)}｜{score:.1f}/10
@@ -1271,7 +1283,7 @@ def build_daily_report(
 
     report = textwrap.dedent(
         f"""
-        <b>{escape_html(MONITOR_NAME)}日報</b>
+        <b>⭐ 輿情監控日報 ⭐</b>
 
         <b>⭐ 觀測區間</b>
         最近 {hours} 小時
@@ -1322,13 +1334,15 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
         similar_count = 0
         new_count = 0
         sent_count = 0
-        recent_titles = [] if ignore_dedupe else load_recent_titles(conn, hours=DEDUPE_HOURS)
+        window_start_utc = current_monitor_window_start_utc()
+        recent_titles = [] if ignore_dedupe else load_recent_titles_since(conn, since_utc=window_start_utc)
 
         for item in news_items:
             base_dedupe_key = build_dedupe_key(item["title"], item["link"])
             item["dedupe_key"] = base_dedupe_key
-            if not ignore_dedupe and article_exists(conn, base_dedupe_key, hours=DEDUPE_HOURS):
+            if not ignore_dedupe and article_exists_since(conn, base_dedupe_key, since_utc=window_start_utc):
                 duplicate_count += 1
+                logger.info(f"[當日重複略過] {item['title']} | 監控起點={window_start_utc} UTC")
                 continue
             if not ignore_dedupe:
                 similar_title = find_similar_title_in_memory(recent_titles, item["title"])

@@ -325,6 +325,9 @@ DEDUPE_HOURS = env_int("DEDUPE_HOURS", 24)
 TELEGRAM_PREVIEW = env_bool("TELEGRAM_PREVIEW", True)
 MAX_FEED_WORKERS = env_int("MAX_FEED_WORKERS", 4)
 RECENT_NEWS_HOURS = env_float("RECENT_NEWS_HOURS", 1.5)
+POLL_IMPORTANCE_BONUS = env_float("POLL_IMPORTANCE_BONUS", 0.9)
+CAMPAIGN_IMPORTANCE_BONUS = env_float("CAMPAIGN_IMPORTANCE_BONUS", 0.7)
+ELECTION_KEYWORD_BONUS = env_float("ELECTION_KEYWORD_BONUS", 0.25)
 MIN_PUSH_IMPORTANCE = float(os.getenv("MIN_PUSH_IMPORTANCE", "6.5"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_PATH = Path(os.getenv("NEWS_MONITOR_LOG", str(Path(__file__).resolve().with_name("news_monitor.log"))))
@@ -538,12 +541,42 @@ def infer_angle(text: str) -> str:
     return "中性"
 
 
+def apply_importance_bias(
+    base_score: float,
+    title: str,
+    matched_keywords: list[str],
+    category: str,
+) -> float:
+    score = float(base_score)
+    boost = 0.0
+
+    if category == "民調聲量":
+        boost += POLL_IMPORTANCE_BONUS
+    elif category == "選戰動態":
+        boost += CAMPAIGN_IMPORTANCE_BONUS
+
+    sensitive_keywords = {
+        "民調", "聲量", "支持度", "滿意度", "好感度", "反感度",
+        "選舉", "罷免", "補選", "初選", "提名", "造勢", "輔選",
+    }
+    hot_hits = sum(1 for keyword in matched_keywords if keyword in sensitive_keywords)
+    boost += min(0.6, hot_hits * ELECTION_KEYWORD_BONUS)
+
+    normalized_title = title or ""
+    if any(word in normalized_title for word in ["民調", "支持度", "滿意度"]):
+        boost += 0.2
+    if any(word in normalized_title for word in ["選舉", "罷免", "補選", "初選", "提名", "造勢"]):
+        boost += 0.2
+
+    return round(min(9.8, score + boost), 1)
+
+
 def fallback_analysis(title: str, matched_keywords: list[str]) -> dict[str, Any]:
     topic = infer_topic(title)
     entities = infer_entities(title)
     category = infer_category(title)
     angle = infer_angle(title)
-    importance = min(9.8, 4.0 + keyword_score(title) * 0.55)
+    importance = apply_importance_bias(4.0 + keyword_score(title) * 0.55, title, matched_keywords, category)
     keyword_text = "、".join(matched_keywords[:5]) if matched_keywords else "未命中關鍵字"
     summary = (
         f"這則消息偏向 {topic}，主要關注對象為 {', '.join(entities)}。"
@@ -607,6 +640,7 @@ def analyze_news(client: Any, title: str, matched_keywords: list[str]) -> dict[s
         payload["angle"] = payload.get("angle") or infer_angle(title)
         payload["category"] = payload.get("category") or infer_category(title)
         payload["topic"] = payload.get("topic") or infer_topic(title)
+        payload["importance"] = apply_importance_bias(payload["importance"], title, matched_keywords, payload["category"])
         payload["impact_analysis"] = (payload.get("impact_analysis") or f"此事可能牽動{payload['topic']}後續攻防與聲量。")[:50]
         payload["action_suggest"] = (payload.get("action_suggest") or "建議持續觀察當事人回應與媒體延燒。")[:50]
         payload["matched_keywords"] = matched_keywords

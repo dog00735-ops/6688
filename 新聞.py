@@ -132,6 +132,16 @@ DEFAULT_TOPIC_HINTS = {
 
 DEFAULT_POSITIVE_HINTS = ["宣布", "支持", "主打", "推出", "領先", "看好", "回升"]
 DEFAULT_NEGATIVE_HINTS = ["質疑", "爭議", "弊案", "失言", "起訴", "檢調", "下滑", "暴跌"]
+DEFAULT_TAIWAN_RELEVANCE_KEYWORDS = [
+    "台灣", "中華民國", "總統", "副總統", "立委", "立法院", "國會", "行政院", "內閣",
+    "民進黨", "國民黨", "民眾黨", "時代力量", "基進", "新黨", "親民黨",
+    "賴清德", "蕭美琴", "侯友宜", "柯文哲", "黃國昌", "朱立倫", "蔣萬安", "盧秀燕", "韓國瑜",
+    "選舉", "罷免", "補選", "初選", "提名", "造勢", "輔選", "民調", "聲量", "支持度", "滿意度",
+    "新北", "台北", "北市", "桃園", "台中", "台南", "高雄", "基隆", "新竹", "嘉義", "宜蘭", "花蓮", "台東", "澎湖", "金門", "連江",
+]
+DEFAULT_FOREIGN_NOISE_KEYWORDS = [
+    "美國副總統", "范斯", "賀錦麗", "巴基斯坦", "伊朗", "北韓", "日本", "中美關係", "國際焦點"
+]
 
 DEFAULT_ALLOWED_SOURCE_NAMES = [
     "Google News 台灣政治",
@@ -348,6 +358,8 @@ ALLOWED_SOURCE_DOMAINS = env_csv("ALLOWED_SOURCE_DOMAINS", DEFAULT_ALLOWED_SOURC
 PRIORITY_KEYWORDS = env_csv("PRIORITY_KEYWORDS", DEFAULT_PRIORITY_KEYWORDS)
 POSITIVE_HINTS = env_csv("POSITIVE_HINTS", DEFAULT_POSITIVE_HINTS)
 NEGATIVE_HINTS = env_csv("NEGATIVE_HINTS", DEFAULT_NEGATIVE_HINTS)
+TAIWAN_RELEVANCE_KEYWORDS = env_csv("TAIWAN_RELEVANCE_KEYWORDS", DEFAULT_TAIWAN_RELEVANCE_KEYWORDS)
+FOREIGN_NOISE_KEYWORDS = env_csv("FOREIGN_NOISE_KEYWORDS", DEFAULT_FOREIGN_NOISE_KEYWORDS)
 ENTITY_HINTS = env_json_dict("ENTITY_HINTS_JSON", DEFAULT_ENTITY_HINTS)
 TOPIC_HINTS = env_json_dict("TOPIC_HINTS_JSON", DEFAULT_TOPIC_HINTS)
 RSS_FEEDS = DEFAULT_RSS_FEEDS
@@ -772,6 +784,22 @@ def is_allowed_source(feed_name: str, link: str, title: str) -> bool:
     return allowed_name and allowed_domain
 
 
+def is_precise_relevant_title(title: str, matched_keywords: list[str]) -> bool:
+    title_text = title or ""
+    if any(keyword in title_text for keyword in TAIWAN_RELEVANCE_KEYWORDS):
+        return True
+
+    matched_set = set(matched_keywords)
+    election_focus = {"民調", "聲量", "支持度", "滿意度", "選舉", "罷免", "補選", "初選", "提名", "造勢"}
+    if matched_set & election_focus:
+        return True
+
+    if any(keyword in title_text for keyword in FOREIGN_NOISE_KEYWORDS):
+        return False
+
+    return False
+
+
 def load_feed(url: str) -> Any:
     req = request.Request(
         url,
@@ -816,6 +844,9 @@ def fetch_feed_items(feed_config: dict[str, str], recent_hours: int = RECENT_NEW
 
         matched = keyword_matches(title)
         if not matched:
+            continue
+        if not is_precise_relevant_title(title, matched):
+            logger.info(f"[內容精準化略過] {feed_config['name']} | {title} | matched={','.join(matched[:5])}")
             continue
 
         items.append(

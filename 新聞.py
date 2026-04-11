@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import ssl
 import textwrap
@@ -132,6 +133,25 @@ DEFAULT_TOPIC_HINTS = {
 
 DEFAULT_POSITIVE_HINTS = ["宣布", "支持", "主打", "推出", "領先", "看好", "回升"]
 DEFAULT_NEGATIVE_HINTS = ["質疑", "爭議", "弊案", "失言", "起訴", "檢調", "下滑", "暴跌"]
+
+EVENT_FINGERPRINT_EXTRA_TERMS = [
+    "藍白合", "鄭習會", "判決書", "判決理由", "判決", "新聞稿", "內容不一致", "不一致",
+    "北院", "北檢", "法院", "法官", "中選會", "提告", "搜索", "收押", "起訴", "羈押",
+    "罷免", "民調", "聲量", "提名", "初選", "補選", "造勢", "說明", "要求說明",
+]
+
+EVENT_FINGERPRINT_IGNORE_TERMS = {
+    "總統", "副總統", "立委", "立法院", "國會", "台灣", "中華民國", "政治", "新聞",
+    "民進黨", "國民黨", "民眾黨", "政府", "總統府", "行政院", "兩岸", "外交", "政策",
+    "輿情", "爭議", "回應", "快訊", "快報", "快評", "今日", "表示", "指出", "強調",
+}
+
+EVENT_TERM_SYNONYMS = {
+    "判決書": "判決",
+    "判決理由": "判決",
+    "要求說明": "說明",
+    "內容不一致": "不一致",
+}
 DEFAULT_TAIWAN_RELEVANCE_KEYWORDS = [
     "台灣", "中華民國", "總統", "副總統", "立委", "立法院", "國會", "行政院", "內閣",
     "民進黨", "國民黨", "民眾黨", "時代力量", "基進", "新黨", "親民黨",
@@ -500,6 +520,67 @@ def build_dedupe_key(title: str, link: str) -> str:
 def build_runtime_dedupe_key(title: str, link: str) -> str:
     timestamp = datetime.now(timezone.utc).isoformat()
     return f"{build_dedupe_key(title, link)}::{timestamp}"
+
+
+def canonicalize_event_term(term: str) -> str:
+    normalized = EVENT_TERM_SYNONYMS.get(term, term).strip()
+    return normalized
+
+
+def extract_event_terms(title: str) -> list[str]:
+    raw_title = title or ""
+    normalized_title = normalize_title_for_event(raw_title)
+    if not normalized_title:
+        return []
+
+    candidate_terms: list[str] = []
+    for term in sorted(set(KEYWORDS + EVENT_FINGERPRINT_EXTRA_TERMS), key=len, reverse=True):
+        cleaned_term = term.strip()
+        if len(cleaned_term) < 2:
+            continue
+        if cleaned_term in EVENT_FINGERPRINT_IGNORE_TERMS:
+            continue
+        if cleaned_term in raw_title or normalize_title_for_event(cleaned_term) in normalized_title:
+            candidate_terms.append(canonicalize_event_term(cleaned_term))
+
+    for entity in infer_entities(raw_title):
+        cleaned_entity = entity.strip()
+        if len(cleaned_entity) < 2:
+            continue
+        if cleaned_entity in {"未明確對象", *EVENT_FINGERPRINT_IGNORE_TERMS}:
+            continue
+        candidate_terms.append(canonicalize_event_term(cleaned_entity))
+
+    deduped_terms: list[str] = []
+    seen = set()
+    for term in candidate_terms:
+        if term in EVENT_FINGERPRINT_IGNORE_TERMS:
+            continue
+        if term in seen:
+            continue
+        seen.add(term)
+        deduped_terms.append(term)
+    return deduped_terms[:8]
+
+
+def build_event_fingerprint(title: str) -> tuple[str, ...]:
+    return tuple(sorted(extract_event_terms(title)))
+
+
+def same_event_fingerprint(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    if not left or not right:
+        return False
+
+    left_set = set(left)
+    right_set = set(right)
+    common = left_set & right_set
+    if len(common) >= 4:
+        return True
+    if len(common) < 3:
+        return False
+
+    overlap_ratio = len(common) / max(len(left_set), len(right_set))
+    return overlap_ratio >= 0.5
 
 
 def keyword_matches(text: str) -> list[str]:
@@ -907,6 +988,7 @@ def fetch_feed_items(feed_config: dict[str, str], recent_hours: int = RECENT_NEW
                 "keyword_score": keyword_score(title),
                 "matched_keywords": matched,
                 "event_key": normalize_title_for_event(title),
+                "event_fingerprint": build_event_fingerprint(title),
             }
         )
 
@@ -931,16 +1013,22 @@ def fetch_news(recent_hours: int = RECENT_NEWS_HOURS) -> list[dict[str, Any]]:
     deduped_items = []
     seen_links = set()
     seen_events = set()
+    seen_event_fingerprints: list[tuple[str, ...]] = []
     for item in items:
         normalized_link = normalize_text(item["link"])
         event_key = item["event_key"]
+        event_fingerprint = item.get("event_fingerprint", ())
         if normalized_link in seen_links:
             continue
         if event_key and event_key in seen_events:
             continue
+        if event_fingerprint and any(same_event_fingerprint(event_fingerprint, existing) for existing in seen_event_fingerprints):
+            continue
         seen_links.add(normalized_link)
         if event_key:
             seen_events.add(event_key)
+        if event_fingerprint:
+            seen_event_fingerprints.append(event_fingerprint)
         deduped_items.append(item)
 
     if failed_sources == len(RSS_FEEDS):
@@ -992,6 +1080,8 @@ def find_similar_title_in_memory(existing_titles: list[str], title: str) -> str 
     if not normalized_title:
         return None
 
+    event_fingerprint = build_event_fingerprint(title)
+
     for existing_title in existing_titles:
         existing_normalized = normalize_title_for_event(existing_title)
         if not existing_normalized:
@@ -1005,7 +1095,9 @@ def find_similar_title_in_memory(existing_titles: list[str], title: str) -> str 
                 or existing_normalized in normalized_title
             )
         )
-        if ratio >= 0.72 or contains_match:
+        existing_fingerprint = build_event_fingerprint(existing_title)
+        same_fingerprint = same_event_fingerprint(event_fingerprint, existing_fingerprint)
+        if ratio >= 0.72 or contains_match or same_fingerprint:
             return existing_title
     return None
 

@@ -1324,17 +1324,23 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
     conn = init_db()
     try:
         client = get_openai_client()
+        window_start_utc = current_monitor_window_start_utc()
+        window_start_local = datetime.strptime(window_start_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(TAIPEI_CST)
+        window_label = window_start_local.strftime("%Y-%m-%d %H:%M:%S CST")
+
         news_items = fetch_news(recent_hours=RECENT_NEWS_HOURS)
         if not news_items:
-            logger.info("沒有抓到符合條件的輿情新聞。")
+            logger.info(f"[監控結果] 沒有抓到符合條件的輿情新聞 | 同日去重起點={window_label}")
             return
 
-        logger.info(f"本次抓到 {len(news_items)} 則候選新聞。")
+        logger.info(f"[監控開始] 候選新聞 {len(news_items)} 則 | 同日去重起點={window_label}")
         duplicate_count = 0
         similar_count = 0
+        low_score_count = 0
         new_count = 0
         sent_count = 0
-        window_start_utc = current_monitor_window_start_utc()
+        bq_success_count = 0
+        bq_fail_count = 0
         recent_titles = [] if ignore_dedupe else load_recent_titles_since(conn, since_utc=window_start_utc)
 
         for item in news_items:
@@ -1342,13 +1348,13 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
             item["dedupe_key"] = base_dedupe_key
             if not ignore_dedupe and article_exists_since(conn, base_dedupe_key, since_utc=window_start_utc):
                 duplicate_count += 1
-                logger.info(f"[當日重複略過] {item['title']} | 監控起點={window_start_utc} UTC")
+                logger.info(f"[當日重複略過] {item['title']} | 比對區間起點={window_label}")
                 continue
             if not ignore_dedupe:
                 similar_title = find_similar_title_in_memory(recent_titles, item["title"])
                 if similar_title is not None:
                     similar_count += 1
-                    logger.info(f"[相似略過] {item['title']} | 類似於: {similar_title}")
+                    logger.info(f"[相似略過] {item['title']} | 類似於: {similar_title} | 比對區間起點={window_label}")
                     continue
             if ignore_dedupe:
                 item["dedupe_key"] = build_runtime_dedupe_key(item["title"], item["link"])
@@ -1358,6 +1364,7 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
                 article_id = save_article(conn, item, analysis)
             except sqlite3.IntegrityError:
                 duplicate_count += 1
+                logger.info(f"[資料庫重複略過] {item['title']}")
                 continue
             recent_titles.insert(0, item["title"])
             recent_titles = recent_titles[:200]
@@ -1365,13 +1372,19 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
 
             bq_uploaded, bq_result = upload_to_bigquery(item, analysis)
             if bq_uploaded:
+                bq_success_count += 1
                 logger.info(f"[BigQuery 已同步] {item['title']}")
             else:
+                bq_fail_count += 1
                 logger.info(f"[BigQuery 未同步] {item['title']} | {bq_result}")
 
             score = float(analysis.get("importance", 5))
+            category = analysis.get("category", "一般輿情")
             if score < MIN_PUSH_IMPORTANCE:
-                logger.info(f"[低分未推送] {item['title']} | importance={score:.1f}")
+                low_score_count += 1
+                logger.info(
+                    f"[低分未推送] {item['title']} | 類別={category} | importance={score:.1f} | 門檻={MIN_PUSH_IMPORTANCE:.1f}"
+                )
                 continue
 
             message = format_message(item, analysis)
@@ -1379,18 +1392,21 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
             if sent:
                 mark_as_sent(conn, article_id)
                 sent_count += 1
-                logger.info(f"[已推送] {item['title']}")
+                logger.info(f"[已推送] {item['title']} | 類別={category} | importance={score:.1f}")
             else:
                 logger.warning(f"[已儲存未推送] {item['title']} | {result}")
 
         logger.info("-" * 50)
-        logger.info(f"候選新聞: {len(news_items)} 則")
-        logger.info(f"重複略過: {duplicate_count} 則")
-        logger.info(f"相似略過: {similar_count} 則")
-        logger.info(f"新增情報: {new_count} 則")
-        logger.info(f"Telegram 已推送: {sent_count} 則")
-        logger.info(f"資料庫: {DB_PATH}")
-        logger.info(f"日誌檔: {LOG_PATH}")
+        logger.info(f"[監控總結] 同日去重起點: {window_label}")
+        logger.info(f"[監控總結] 候選新聞: {len(news_items)} 則")
+        logger.info(f"[監控總結] 當日重複略過: {duplicate_count} 則")
+        logger.info(f"[監控總結] 相似略過: {similar_count} 則")
+        logger.info(f"[監控總結] 新增情報: {new_count} 則")
+        logger.info(f"[監控總結] 低分未推送: {low_score_count} 則")
+        logger.info(f"[監控總結] Telegram 已推送: {sent_count} 則")
+        logger.info(f"[監控總結] BigQuery 成功: {bq_success_count} 則 | 失敗: {bq_fail_count} 則")
+        logger.info(f"[監控總結] 資料庫: {DB_PATH}")
+        logger.info(f"[監控總結] 日誌檔: {LOG_PATH}")
     finally:
         conn.close()
 

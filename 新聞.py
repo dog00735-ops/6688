@@ -236,6 +236,7 @@ NOISE_PATTERNS = [
 ]
 
 SSL_CONTEXT: ssl.SSLContext | None = None
+TAIPEI_CST = timezone(timedelta(hours=8), name="CST")
 
 
 def load_dotenv(env_path: str | None = None) -> None:
@@ -662,6 +663,13 @@ def published_time_for_storage(raw_value: str) -> str:
     if parsed_dt is None:
         return sqlite_utc_now()
     return parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_display_time(raw_value: str) -> str:
+    parsed_dt = parse_datetime_text(raw_value)
+    if parsed_dt is None:
+        return raw_value or "未知時間"
+    return parsed_dt.astimezone(TAIPEI_CST).strftime("%Y-%m-%d %H:%M:%S CST")
 
 
 def parse_entry_datetime(entry: Any) -> datetime | None:
@@ -1133,7 +1141,7 @@ def generate_daily_commentary(client: Any | None, recent_articles: list[sqlite3.
 def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
     entities = compact_list(analysis.get("entities", []), limit=3)
     keywords = compact_list(analysis.get("matched_keywords", item.get("matched_keywords", [])), limit=4)
-    published = item.get("published_at") or "未知時間"
+    published = format_display_time(item.get("published_at", ""))
     score = float(analysis.get("importance", 5))
     headline = clean_headline(item["title"], max_length=42)
     return textwrap.dedent(

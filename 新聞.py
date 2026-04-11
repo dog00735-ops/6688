@@ -140,7 +140,8 @@ DEFAULT_TAIWAN_RELEVANCE_KEYWORDS = [
     "新北", "台北", "北市", "桃園", "台中", "台南", "高雄", "基隆", "新竹", "嘉義", "宜蘭", "花蓮", "台東", "澎湖", "金門", "連江",
 ]
 DEFAULT_FOREIGN_NOISE_KEYWORDS = [
-    "美國副總統", "范斯", "賀錦麗", "巴基斯坦", "伊朗", "北韓", "日本", "中美關係", "國際焦點"
+    "美國副總統", "范斯", "賀錦麗", "巴基斯坦", "伊朗", "北韓", "日本", "中美關係", "國際焦點",
+    "美軍", "飛彈", "核武", "華府", "川普", "國務院"
 ]
 
 DEFAULT_ALLOWED_SOURCE_NAMES = [
@@ -786,17 +787,24 @@ def is_allowed_source(feed_name: str, link: str, title: str) -> bool:
 
 def is_precise_relevant_title(title: str, matched_keywords: list[str]) -> bool:
     title_text = title or ""
-    if any(keyword in title_text for keyword in TAIWAN_RELEVANCE_KEYWORDS):
-        return True
-
     matched_set = set(matched_keywords)
-    election_focus = {"民調", "聲量", "支持度", "滿意度", "選舉", "罷免", "補選", "初選", "提名", "造勢"}
-    if matched_set & election_focus:
-        return True
 
-    if any(keyword in title_text for keyword in FOREIGN_NOISE_KEYWORDS):
+    strong_taiwan_signals = {
+        "台灣", "中華民國", "民進黨", "國民黨", "民眾黨", "賴清德", "侯友宜", "柯文哲",
+        "黃國昌", "朱立倫", "蔣萬安", "盧秀燕", "韓國瑜", "新北", "台北", "北市", "桃園",
+        "台中", "台南", "高雄", "立法院", "立委", "行政院", "內閣"
+    }
+    election_focus = {"民調", "聲量", "支持度", "滿意度", "選舉", "罷免", "補選", "初選", "提名", "造勢", "輔選"}
+    foreign_noise_hit = any(keyword in title_text for keyword in FOREIGN_NOISE_KEYWORDS)
+    strong_taiwan_hit = any(keyword in title_text for keyword in strong_taiwan_signals)
+    election_hit = bool(matched_set & election_focus)
+
+    if foreign_noise_hit and not (strong_taiwan_hit or election_hit):
         return False
-
+    if strong_taiwan_hit:
+        return True
+    if election_hit:
+        return True
     return False
 
 

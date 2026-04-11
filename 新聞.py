@@ -555,6 +555,43 @@ def infer_angle(text: str) -> str:
     return "中性"
 
 
+MAJOR_POLITICAL_ENTITIES = {"賴清德", "侯友宜", "柯文哲", "黃國昌", "朱立倫", "蔣萬安", "盧秀燕", "韓國瑜", "民進黨", "國民黨", "民眾黨"}
+S_PRIORITY_KEYWORDS = {"民調", "聲量", "支持度", "滿意度", "選舉", "罷免", "補選", "初選", "提名", "造勢", "輔選"}
+A_PRIORITY_KEYWORDS = {"總統", "副總統", "立委", "立法院", "國會", "法案", "總預算", "起訴", "檢調", "爭議"}
+
+
+def determine_priority_tier(
+    title: str,
+    category: str,
+    importance: float,
+    entities: list[str],
+    matched_keywords: list[str],
+) -> str:
+    title_text = title or ""
+    entity_set = {entity for entity in entities if entity}
+    keyword_set = {keyword for keyword in matched_keywords if keyword}
+    major_entity_hit = bool(entity_set & MAJOR_POLITICAL_ENTITIES)
+    s_keyword_hit = bool(keyword_set & S_PRIORITY_KEYWORDS)
+    a_keyword_hit = bool(keyword_set & A_PRIORITY_KEYWORDS)
+    dispute_hit = any(word in title_text for word in ["爭議", "起訴", "檢調", "搜索", "民調", "初選", "罷免"])
+
+    if (
+        category in {"民調聲量", "選戰動態"}
+        and s_keyword_hit
+        and (major_entity_hit or importance >= 8.0)
+    ):
+        return "S"
+    if (
+        category in {"民調聲量", "選戰動態", "爭議事件", "國會攻防"}
+        and (major_entity_hit or s_keyword_hit or a_keyword_hit or dispute_hit)
+        and importance >= 7.0
+    ):
+        return "A"
+    if category in {"兩岸外交", "政策議題", "國會攻防", "爭議事件"} or major_entity_hit:
+        return "B"
+    return "C"
+
+
 def apply_importance_bias(
     base_score: float,
     title: str,
@@ -599,12 +636,14 @@ def fallback_analysis(title: str, matched_keywords: list[str]) -> dict[str, Any]
     )
     impact_analysis = f"短期內可能牽動{topic}相關攻防與聲量變化，建議持續追蹤後續回應。"
     action_suggest = f"優先監看{keyword_text}與主要對象後續表態。"
+    priority_tier = determine_priority_tier(title, category, importance, entities, matched_keywords)
     return {
         "summary": summary,
         "category": category,
         "topic": topic,
         "entities": entities,
         "importance": round(importance, 1),
+        "priority_tier": priority_tier,
         "angle": angle,
         "impact_analysis": impact_analysis[:50],
         "action_suggest": action_suggest[:50],
@@ -655,6 +694,7 @@ def analyze_news(client: Any, title: str, matched_keywords: list[str]) -> dict[s
         payload["category"] = payload.get("category") or infer_category(title)
         payload["topic"] = payload.get("topic") or infer_topic(title)
         payload["importance"] = apply_importance_bias(payload["importance"], title, matched_keywords, payload["category"])
+        payload["priority_tier"] = determine_priority_tier(title, payload["category"], payload["importance"], payload["entities"], matched_keywords)
         payload["impact_analysis"] = (payload.get("impact_analysis") or f"此事可能牽動{payload['topic']}後續攻防與聲量。")[:50]
         payload["action_suggest"] = (payload.get("action_suggest") or "建議持續觀察當事人回應與媒體延燒。")[:50]
         payload["matched_keywords"] = matched_keywords
@@ -1235,6 +1275,7 @@ def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
         <b>{escape_html(headline)}</b>
 
         <b>評級</b>：{importance_label(score)}｜{score:.1f}/10
+        <b>優先級</b>：{escape_html(analysis.get('priority_tier', 'B'))}
         <b>類別</b>：{escape_html(analysis.get('category', '一般輿情'))}
         <b>風向</b>：{escape_html(analysis.get('angle', '中性'))}
         <b>對象</b>：{escape_html(entities)}
@@ -1284,6 +1325,7 @@ def build_daily_report(
 
     category_counts: dict[str, int] = {}
     angle_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
     keyword_counts: dict[str, int] = {}
     top_lines: list[str] = []
     high_priority_count = 0
@@ -1298,14 +1340,16 @@ def build_daily_report(
             high_priority_count += 1
 
         entities = json.loads(row["entities"]) if row["entities"] else []
-        entity_text = compact_list(entities, limit=1, fallback="")
         keywords = json.loads(row["matched_keywords"]) if row["matched_keywords"] else []
+        priority_tier = determine_priority_tier(row["title"], category, score, entities, keywords)
+        priority_counts[priority_tier] = priority_counts.get(priority_tier, 0) + 1
+        entity_text = compact_list(entities, limit=1, fallback="")
         for keyword in keywords[:3]:
             keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
 
         if index <= min(limit, 6):
             headline = clean_headline(row["title"], max_length=36)
-            meta_parts = [category]
+            meta_parts = [priority_tier, category]
             if entity_text:
                 meta_parts.append(entity_text)
             meta_parts.append(f"{score:.1f}/10")
@@ -1317,6 +1361,7 @@ def build_daily_report(
     category_summary = compact_count_summary(category_counts, limit=2)
     angle_summary = compact_count_summary(angle_counts, limit=2)
     keyword_summary = compact_count_summary(keyword_counts, limit=3)
+    priority_summary = compact_count_summary(priority_counts, limit=4)
     top_section = "\n\n".join(top_lines) if top_lines else "今日無重點新聞。"
     commentary_winner, commentary_text = generate_daily_commentary(client, recent_articles)
 
@@ -1331,6 +1376,7 @@ def build_daily_report(
         情報數：{len(recent_articles)} 則
         高關注：{high_priority_count} 則
         ⭐ 主戰場：{escape_html(category_summary)}
+        🎯 優先級：{escape_html(priority_summary)}
         🌪️ 風向：{escape_html(angle_summary)}
         🔥 熱詞：{escape_html(keyword_summary)}
 
@@ -1419,10 +1465,11 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
 
             score = float(analysis.get("importance", 5))
             category = analysis.get("category", "一般輿情")
+            priority_tier = analysis.get("priority_tier", "B")
             if score < MIN_PUSH_IMPORTANCE:
                 low_score_count += 1
                 logger.info(
-                    f"[低分未推送] {item['title']} | 類別={category} | importance={score:.1f} | 門檻={MIN_PUSH_IMPORTANCE:.1f}"
+                    f"[低分未推送] {item['title']} | 優先級={priority_tier} | 類別={category} | importance={score:.1f} | 門檻={MIN_PUSH_IMPORTANCE:.1f}"
                 )
                 continue
 
@@ -1431,7 +1478,7 @@ def run_monitor_with_options(ignore_dedupe: bool = False) -> None:
             if sent:
                 mark_as_sent(conn, article_id)
                 sent_count += 1
-                logger.info(f"[已推送] {item['title']} | 類別={category} | importance={score:.1f}")
+                logger.info(f"[已推送] {item['title']} | 優先級={priority_tier} | 類別={category} | importance={score:.1f}")
             else:
                 logger.warning(f"[已儲存未推送] {item['title']} | {result}")
 

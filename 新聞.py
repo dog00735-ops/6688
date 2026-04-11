@@ -1146,6 +1146,13 @@ def compact_count_summary(counts: dict[str, int], limit: int = 3, separator: str
     return separator.join(f"{name}{count}" for name, count in ranked)
 
 
+def display_priority_tier(tier: str) -> str:
+    normalized = (tier or "B").strip().upper()
+    if normalized in {"S", "A", "B", "C"}:
+        return f"{normalized}級"
+    return normalized
+
+
 def limit_text(text: str, max_length: int) -> str:
     cleaned = " ".join(str(text or "").split())
     if len(cleaned) <= max_length:
@@ -1227,18 +1234,18 @@ def build_briefing_sections(recent_articles: list[sqlite3.Row]) -> tuple[str, st
 
         if priority_tier == "S" and len(s_focus_lines) < 3:
             focus_headline = clean_headline(title, max_length=34)
-            meta_parts = [category]
+            meta_parts = [display_priority_tier(priority_tier), category]
             if entity_text:
                 meta_parts.append(entity_text)
-            meta_parts.append(f"{score:.1f}/10")
+            meta_parts.append(f"{score:.1f}")
             s_focus_lines.append(f"• {focus_headline}\n　{'｜'.join(meta_parts)}")
 
         if priority_tier in {"S", "A"} and len(watch_lines) < 2:
-            watch_headline = clean_headline(title, max_length=30)
-            watch_lines.append(f"• {watch_headline}")
+            watch_headline = clean_headline(title, max_length=28)
+            watch_lines.append(f"• 追 {watch_headline} 後續聲量與主要回應")
 
     s_focus_section = "\n\n".join(s_focus_lines) if s_focus_lines else "• 今日無明顯S級焦點，整體偏延續型攻防。"
-    watch_section = "\n".join(watch_lines) if watch_lines else "• 明日暫無明確追蹤主軸，可先觀察民調與提名動態。"
+    watch_section = "\n".join(watch_lines) if watch_lines else "• 明日先追民調、提名與藍綠白主要表態是否出現新變化。"
     opening = "• 今日輿情主軸集中在高優先級選戰/聲量題，建議優先關注S、A級焦點的延伸反應。"
     return opening, s_focus_section, watch_section
 
@@ -1306,7 +1313,7 @@ def format_message(item: dict[str, Any], analysis: dict[str, Any]) -> str:
         <b>{escape_html(headline)}</b>
 
         <b>評級</b>：{importance_label(score)}｜{score:.1f}/10
-        <b>優先級</b>：{escape_html(analysis.get('priority_tier', 'B'))}
+        <b>優先級</b>：{escape_html(display_priority_tier(analysis.get('priority_tier', 'B')))}
         <b>類別</b>：{escape_html(analysis.get('category', '一般輿情'))}
         <b>風向</b>：{escape_html(analysis.get('angle', '中性'))}
         <b>對象</b>：{escape_html(entities)}
@@ -1378,12 +1385,12 @@ def build_daily_report(
         for keyword in keywords[:3]:
             keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
 
-        if index <= min(limit, 6):
+        if index <= min(limit, 5):
             headline = clean_headline(row["title"], max_length=36)
-            meta_parts = [priority_tier, category]
+            meta_parts = [display_priority_tier(priority_tier), category]
             if entity_text:
                 meta_parts.append(entity_text)
-            meta_parts.append(f"{score:.1f}/10")
+            meta_parts.append(f"{score:.1f}")
             top_lines.append(
                 f"{index}. {headline}\n"
                 f"　{'｜'.join(meta_parts)}"
